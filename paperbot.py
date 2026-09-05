@@ -42,8 +42,26 @@ import urllib.request
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STATE_DIR = os.environ.get("STATE_DIR") or HERE
-os.makedirs(STATE_DIR, exist_ok=True)
+
+
+def _pick_state_dir():
+    want = os.environ.get("STATE_DIR") or HERE
+    try:
+        os.makedirs(want, exist_ok=True)
+        probe = os.path.join(want, ".write-test")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return want
+    except OSError:
+        # e.g. STATE_DIR=/data set but no disk mounted yet -- run anyway,
+        # ephemerally, so the service is up while the disk gets added.
+        print(f"WARN: STATE_DIR {want!r} not writable; using {HERE} "
+              f"(state will NOT survive a restart)")
+        return HERE
+
+
+STATE_DIR = _pick_state_dir()
 CONFIG_PATH = os.path.join(HERE, "config.json")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 TRADES_PATH = os.path.join(STATE_DIR, "trades.csv")
