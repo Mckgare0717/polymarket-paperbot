@@ -32,6 +32,7 @@ Usage:
     python paperbot.py report     # print paper P&L + open positions
     python paperbot.py trades     # dump all recorded trades as CSV to stdout
     python paperbot.py ai "<q>"   # test the LLM connection on one question
+    python paperbot.py reset      # archive state + trades, start fresh at $1000
 
 Set STATE_DIR to put state.json / trades.csv / bot.log somewhere else -- point
 it at a mounted persistent disk in the cloud so a restart keeps the bankroll
@@ -211,6 +212,13 @@ def save_state(state, broker):
 
 
 def record_trade(action, pos, price, cash_after):
+    # if an older-format trades.csv is sitting there, retire it rather than
+    # append mismatched columns
+    if os.path.exists(TRADES_PATH):
+        with open(TRADES_PATH, encoding="utf-8") as f:
+            header_ok = f.readline().strip() == ",".join(TRADE_HEADER)
+        if not header_ok:
+            os.replace(TRADES_PATH, TRADES_PATH[:-4] + ".legacy.csv")
     newfile = not os.path.exists(TRADES_PATH)
     with open(TRADES_PATH, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -838,6 +846,15 @@ def main():
         run_selftest()
         return
     cfg = load_config()
+    if mode == "reset":
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        for p in (STATE_PATH, TRADES_PATH):
+            if os.path.exists(p):
+                os.replace(p, f"{p}.{stamp}.bak")
+                print(f"archived {os.path.basename(p)} -> {os.path.basename(p)}.{stamp}.bak")
+        json.dump(_fresh_state(cfg), open(STATE_PATH, "w"), indent=2)
+        print(f"fresh state: ${cfg['start_bankroll']:.2f}")
+        return
     if mode == "trades":
         run_dump_trades(cfg)
         return
