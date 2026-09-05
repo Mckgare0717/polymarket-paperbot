@@ -1,0 +1,5 @@
+state.json
+state.json.tmp
+trades.csv
+bot.log
+__pycache__/
