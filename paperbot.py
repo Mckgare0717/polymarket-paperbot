@@ -129,6 +129,9 @@ DEFAULTS = {
     "ai_base_url": "https://api.groq.com/openai/v1",
     "ai_model": "qwen/qwen3.8-27b",
     "ai_timeout": 20,
+    # news lookup (Tavily) feeding the AI filter; only active if TAVILY_API_KEY set
+    "news_days": 3,
+    "news_max_results": 4,
 }
 
 
@@ -443,25 +446,59 @@ def parse_ai_verdict(raw):
     return allow, str(v.get("reason", ""))[:140]
 
 
+def news_headlines(query, cfg):
+    """Recent news snippets for a topic via Tavily, or [] if unavailable."""
+    key = os.environ.get("TAVILY_API_KEY")
+    if not key:
+        return []
+    try:
+        body = json.dumps({
+            "query": query,
+            "topic": "news",
+            "days": cfg["news_days"],
+            "max_results": cfg["news_max_results"],
+            "search_depth": "basic",
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.tavily.com/search", data=body, method="POST",
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json",
+                     "User-Agent": "paperbot/1.0"})
+        with urllib.request.urlopen(req, timeout=cfg["ai_timeout"]) as r:
+            d = json.loads(r.read().decode())
+    except Exception:  # noqa: BLE001 - news is a bonus, never fatal
+        return []
+    out = []
+    for x in d.get("results", []):
+        snip = " ".join((x.get("content") or "").split())[:200]
+        out.append(f"- {x.get('title', '?')} "
+                   f"({x.get('published_date', '')}): {snip}")
+    return out
+
+
 def ai_check(market, strategy, token_index, note, cfg):
     """(allow, reason). Fails OPEN -- a dead API must never block trading."""
     side = market["outcomes"][token_index]
+    heads = news_headlines(market["question"], cfg)
+    news_block = ("\n\nRecent news (last few days):\n" + "\n".join(heads)
+                  if heads else
+                  "\n\n(No news feed available -- use your own knowledge.)")
     prompt = (
         "A technical trading rule found a statistical signal on a Polymarket "
         "prediction market and wants to place this trade. You are the veto "
         "check. DEFAULT TO ALLOWING. Only answer \"skip\" if you have a "
-        "SPECIFIC concrete reason -- a known recent event, scheduled "
-        "announcement, or clear structural problem -- that makes this "
-        "particular trade likely to lose. General caution, 'depends on news', "
-        "or 'markets are hard' are NOT reasons to skip.\n\n"
+        "SPECIFIC concrete reason that makes THIS trade likely to lose. "
+        "General caution or 'markets are hard' are NOT reasons to skip.\n\n"
         f"Market: {market['question']}\n"
         f"Price of '{market['outcomes'][0]}': {market['ref_price']:.2f}\n"
         f"Rule: {strategy} -- {note}\n"
-        f"Trade: BUY '{side}'\n\n"
-        "For a mean_reversion trade, skip only if you know of real news in the "
-        "last day that explains the move (then it is not noise). For momentum, "
-        "skip only if you expect an imminent reversal. For favorite, skip only "
-        "if the favorite is in real jeopardy.\n"
+        f"Trade: BUY '{side}'"
+        f"{news_block}\n\n"
+        "mean_reversion skips only if recent news plausibly explains the move "
+        "(then it is information, not noise). momentum skips only if news "
+        "points to an imminent reversal. favorite skips only if the favorite "
+        "is in real jeopardy. Stale or irrelevant headlines are not a reason "
+        "to skip.\n"
         'Reply ONLY as JSON: {"decision": "take" or "skip", "reason": "<15 words"}'
     )
     try:
@@ -756,6 +793,8 @@ def run_selftest():
     os.environ.pop("GROQ_API_KEY", None)
     os.environ.pop("AI_API_KEY", None)
     assert ai_available(cfg) is False
+    os.environ.pop("TAVILY_API_KEY", None)
+    assert news_headlines("anything", cfg) == []
 
     p = {"entry_price": 0.50, "entry_ts": now_ts()}
     assert exit_signal(p, 0.58, None, cfg) == "take_profit"
@@ -784,6 +823,12 @@ def main():
             return
         fake = {"question": q, "outcomes": ["Yes", "No"], "ref_price": 0.42}
         print(f"model: {cfg['ai_model']}  @ {cfg['ai_base_url']}")
+        heads = news_headlines(q, cfg)
+        print(f"news: {len(heads)} headline(s)"
+              + (" (no TAVILY_API_KEY)" if not os.environ.get('TAVILY_API_KEY')
+                 else ""))
+        for h in heads:
+            print(f"  {h}")
         print(ai_check(fake, "mean_reversion", 0, "fade -0.10/60m", cfg))
         return
     if mode in ("report", "once"):
