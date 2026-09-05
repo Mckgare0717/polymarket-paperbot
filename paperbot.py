@@ -50,19 +50,21 @@ GAMMA = "https://gamma-api.polymarket.com"
 # Cloud mode: if REDIS_URL is set, state + trades live in Redis instead of local
 # files, so a Render/VPS restart doesn't wipe the bankroll and open positions.
 _REDIS = None
-_REDIS_TRIED = False
 
 
 def redis_client():
-    global _REDIS, _REDIS_TRIED
-    if _REDIS_TRIED:
+    """Connected client if REDIS_URL is set, else None. Raises if set but down
+    (callers in `run` mode retry; a fresh KV can take a minute to resolve)."""
+    global _REDIS
+    if _REDIS is not None:
         return _REDIS
-    _REDIS_TRIED = True
     url = os.environ.get("REDIS_URL")
-    if url:
-        import redis  # only needed in cloud mode
-        _REDIS = redis.from_url(url, decode_responses=True)
-        _REDIS.ping()
+    if not url:
+        return None
+    import redis  # only needed in cloud mode
+    client = redis.from_url(url, decode_responses=True, socket_connect_timeout=5)
+    client.ping()
+    _REDIS = client
     return _REDIS
 
 DEFAULTS = {
@@ -557,33 +559,45 @@ def main():
     if mode == "trades":
         run_dump_trades(cfg)
         return
-    state = load_state(cfg)
-    if mode == "report":
-        run_report(cfg, state)
-    elif mode == "once":
-        run_iteration(cfg, state)
-    elif mode == "run":
-        stop = {"v": False}
-
-        def handler(*_):
-            stop["v"] = True
-            log("stop requested; finishing then exiting")
-
-        signal.signal(signal.SIGINT, handler)
-        signal.signal(signal.SIGTERM, handler)
-        start_health_server()
-        while not stop["v"]:
-            try:
-                run_iteration(cfg, state)
-            except Exception as e:  # noqa: BLE001 - loop must survive
-                log(f"iteration error: {e}")
-            for _ in range(cfg["poll_seconds"]):
-                if stop["v"]:
-                    break
-                time.sleep(1)
-        log("exited")
-    else:
+    if mode in ("report", "once"):
+        state = load_state(cfg)
+        (run_report if mode == "report" else run_iteration)(cfg, state)
+        return
+    if mode != "run":
         print(__doc__)
+        return
+
+    stop = {"v": False}
+
+    def handler(*_):
+        stop["v"] = True
+        log("stop requested; finishing then exiting")
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+    start_health_server()
+
+    def nap(seconds):
+        for _ in range(int(seconds)):
+            if stop["v"]:
+                return
+            time.sleep(1)
+
+    state = None
+    while state is None and not stop["v"]:
+        try:
+            state = load_state(cfg)
+        except Exception as e:  # noqa: BLE001 - KV may still be provisioning
+            log(f"state load failed ({e}); retry in 15s")
+            nap(15)
+
+    while not stop["v"]:
+        try:
+            run_iteration(cfg, state)
+        except Exception as e:  # noqa: BLE001 - loop must survive
+            log(f"iteration error: {e}")
+        nap(cfg["poll_seconds"])
+    log("exited")
 
 
 if __name__ == "__main__":
