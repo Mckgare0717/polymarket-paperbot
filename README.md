@@ -29,19 +29,30 @@ market near resolution. Then a 6h per-market cooldown.
 
 ## AI filter (optional)
 
-If `GROQ_API_KEY` (or `AI_API_KEY`) is in the environment, every candidate
-trade is run past an LLM over an OpenAI-compatible endpoint (default: Groq,
-`qwen/qwen3.8-27b`). It can veto a trade whose price move looks news-driven
-rather than noise. It **fails open** — a dead or slow API never blocks trading —
-and defaults to allowing unless it has a specific concrete objection, which is
-logged. Toggle with `ai_filter` in config; swap provider via `ai_base_url` /
-`ai_model`.
+If `GROQ_API_KEY` (or `AI_API_KEY`) is set, every candidate trade is checked
+before it's placed:
 
-Current limitation: the model reasons from training knowledge, so it mostly
-rubber-stamps and only occasionally catches something. A live news feed
-(`groq/compound-mini` has web search) is the upgrade path.
+1. **`TAVILY_API_KEY`** (optional) → Tavily pulls the last few days of news
+   headlines for that market's topic.
+2. **LLM** (OpenAI-compatible endpoint, default Groq `qwen/qwen3.8-27b`) reads
+   the headlines + the trade and returns take / skip. It **defaults to take** —
+   it only vetoes with a specific concrete reason, which is logged and stored
+   on the trade.
 
-    python paperbot.py ai "Will the Fed cut rates in September?"   # test the LLM link
+**Fails open** at every step: no Tavily key → LLM uses training knowledge; any
+API error → the trade proceeds. A dead filter never blocks trading.
+
+Real examples from testing (Sept 2026):
+- *"Russia–Ukraine ceasefire by Oct 31"* → **skip** — "Trump envoys in Moscow
+  for peace talks; move is news-driven, not noise"
+- *"Powell remains Fed Chair through 2026"* → **skip** — "news says Powell is
+  no longer Fed Chair, Yes ≈ worthless"
+- *"Anthropic best AI model end of Sept"* → **take** — "news supports the buy"
+
+Toggle with `ai_filter`; swap provider via `ai_base_url` / `ai_model`; tune the
+lookup with `news_days` / `news_max_results`.
+
+    python paperbot.py ai "Will the Fed cut rates in September?"   # test the chain
 
 ## Quick start
 
