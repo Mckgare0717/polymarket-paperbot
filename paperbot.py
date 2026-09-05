@@ -5,19 +5,23 @@ No real money, no wallet, no private keys. It pulls public Polymarket market
 data, simulates fills against the last quoted book, and tracks a paper bankroll
 in state.json / trades.csv.
 
-Strategy (phase 1, "market + chart scanner" only):
-  * Universe: active binary (2-outcome) markets with an order book, priced away
-    from the extremes, above a minimum 24h volume + liquidity, sorted by 24h
-    volume.
-  * Signal: track outcome-0's price. If it moved more than `spike_threshold`
-    (probability points) over the last `lookback_min` minutes, FADE it --
-    spike up -> buy outcome 1, spike down -> buy outcome 0.
-  * Entry fill: best ask of the side we buy; spread must be tight.
-  * Exit: take-profit / stop-loss on the held side's own price, a hard time
-    stop, or the market nearing resolution. Then a per-market cooldown.
+Universe: active binary (2-outcome) markets with an order book, priced away from
+the extremes, above a min 24h volume + liquidity, minus anything matching
+`exclude_keywords` (head-to-head sports by default), sorted by 24h volume.
 
-Phase 2 (news / X sentiment) is NOT here yet -- that piece has to prove an edge
-on its own before it gates real trades.
+Strategies (run in `strategies` priority order; first to fire on a market wins,
+and every trade is tagged so `report` shows per-strategy P&L):
+  * mean_reversion -- fade a sharp spike (move >= spike_threshold over
+    lookback_min minutes) that is NOT part of a longer trend.
+  * momentum -- ride a slower, consistent trend over momentum_lookback_min.
+  * favorite -- buy the heavy favorite (favorite_min/max_price) within
+    favorite_max_days of resolution; the longshot-bias edge.
+
+Exit (all strategies): take-profit / stop-loss on the held side's own price, a
+hard time stop, or the market nearing resolution. Then a per-market cooldown.
+
+News / X sentiment is NOT here yet -- that piece has to prove an edge on its own
+before it gates real trades.
 
 Usage:
     python paperbot.py selftest   # internal checks, run this first
@@ -89,7 +93,32 @@ DEFAULTS = {
     "exit_close_buffer_hours": 2,
     "cooldown_hours": 6,
     "price_min": 0.05,
-    "price_max": 0.95,
+    "price_max": 0.97,
+
+    # which strategies to run, in priority order (first one to fire on a
+    # market wins). See the strategy functions for what each does.
+    "strategies": ["mean_reversion", "momentum", "favorite"],
+
+    # mean_reversion: fade a sharp move, betting it partly retraces
+    #   uses lookback_min / spike_threshold above
+    # momentum: ride a slower sustained trend
+    "momentum_lookback_min": 180,
+    "momentum_move_threshold": 0.10,
+    "momentum_consistency": 0.66,
+    # favorite: buy the heavy favorite near resolution (longshot-bias edge)
+    "favorite_min_price": 0.88,
+    "favorite_max_price": 0.96,
+    "favorite_max_days": 21,
+
+    # skip markets whose question contains any of these (case-insensitive).
+    # default list targets head-to-head sports/esports, where "fade the
+    # spike" logic backfires (a spike there is usually real game news).
+    "exclude_keywords": [
+        " vs. ", " vs ", " win on ", " beat ", "us open", "atp:", "wta:",
+        "ufc", "nba ", "nfl ", "mlb ", "nhl ", "premier league", "la liga",
+        "serie a", "bundesliga", "champions league", "valorant", "lol:",
+        "cs2", "counter-strike", " bo3", " bo5", "vct",
+    ],
 }
 
 
@@ -134,7 +163,7 @@ def load_config():
     return cfg
 
 
-TRADE_HEADER = ["ts", "action", "market_id", "question", "outcome",
+TRADE_HEADER = ["ts", "action", "strategy", "market_id", "question", "outcome",
                 "price", "shares", "cost", "cash_after"]
 
 
@@ -142,6 +171,7 @@ def _fresh_state(cfg):
     return {
         "cash": cfg["start_bankroll"],
         "realized": 0.0,
+        "realized_by_strategy": {},
         "positions": {},
         "history": {},
         "cooldowns": {},
@@ -159,6 +189,7 @@ def load_state(cfg):
 def save_state(state, broker):
     state["cash"] = broker.cash
     state["realized"] = broker.realized
+    state["realized_by_strategy"] = broker.rbs
     state["positions"] = broker.positions
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -172,8 +203,9 @@ def record_trade(action, pos, price, cash_after):
         w = csv.writer(f)
         if newfile:
             w.writerow(TRADE_HEADER)
-        w.writerow([iso(now_ts()), action, pos["market_id"], pos["question"],
-                    pos["outcome"], f"{price:.4f}", f"{pos['shares']:.4f}",
+        w.writerow([iso(now_ts()), action, pos.get("strategy", "?"),
+                    pos["market_id"], pos["question"], pos["outcome"],
+                    f"{price:.4f}", f"{pos['shares']:.4f}",
                     f"{pos['cost']:.2f}", f"{cash_after:.2f}"])
 
 
@@ -218,14 +250,18 @@ def _row_to_market(m, cfg, apply_filters):
         return None
     if best_bid0 is None or best_ask0 is None:
         return None
+    question = m.get("question") or m.get("slug") or "?"
     if apply_filters:
         if vol24 < cfg["min_volume_24h"] or liq < cfg["min_liquidity"]:
             return None
         if not cfg["price_min"] <= p0 <= cfg["price_max"]:
             return None
+        ql = f" {question.lower()} "
+        if any(kw in ql for kw in cfg["exclude_keywords"]):
+            return None
     return {
         "id": str(m.get("id")),
-        "question": m.get("question") or m.get("slug") or "?",
+        "question": question,
         "outcomes": [str(o) for o in outcomes],
         "tokens": [str(t) for t in tokens],
         "end": parse_end(m.get("endDate")),
@@ -269,20 +305,93 @@ def side_fill_price(market, token_index, kind):
 
 
 # ---------------------------------------------------------------- pure strategy
+#
+# Each strategy is (market, history, cfg) -> (token_index, note) or None.
+# history is a list of (ts, ref_price) ascending. token_index is the outcome
+# to BUY. The executor tries them in cfg["strategies"] order; first hit wins.
 
-def entry_signal(history, cfg):
-    """history: list of (ts, ref_price) ascending. Returns (token_index, move)."""
+
+def _window(history, minutes):
+    if not history:
+        return []
+    cutoff = history[-1][0] - minutes * 60
+    return [h for h in history if h[0] >= cutoff]
+
+
+def strat_mean_reversion(market, history, cfg):
+    """Fade a sharp *spike* -- bet it partly retraces."""
     if len(history) < cfg["min_samples"]:
-        return None, 0.0
-    cutoff = history[-1][0] - cfg["lookback_min"] * 60
-    window = [h for h in history if h[0] >= cutoff]
-    if len(window) < cfg["min_samples"]:
-        return None, 0.0
-    move = window[-1][1] - window[0][1]
+        return None
+    win = _window(history, cfg["lookback_min"])
+    if len(win) < cfg["min_samples"]:
+        return None
+    move = win[-1][1] - win[0][1]
     if abs(move) < cfg["spike_threshold"]:
-        return None, move
-    # fade: ref spiked up -> buy the other outcome (1); down -> buy ref (0)
-    return (1 if move > 0 else 0), move
+        return None
+    # only a spike, not a longer trend -- if the move over the momentum window
+    # is bigger, this is a trend; leave it for strat_momentum.
+    long_win = _window(history, cfg["momentum_lookback_min"])
+    if long_win:
+        long_move = long_win[-1][1] - long_win[0][1]
+        if abs(long_move) > abs(move) * 1.2:
+            return None
+    # spiked up -> buy the other outcome (1); spiked down -> buy ref (0)
+    return (1 if move > 0 else 0), f"fade {move:+.3f}/{cfg['lookback_min']}m"
+
+
+def strat_momentum(market, history, cfg):
+    """Ride a slower, sustained, consistent trend."""
+    if len(history) < cfg["min_samples"]:
+        return None
+    win = _window(history, cfg["momentum_lookback_min"])
+    if len(win) < cfg["min_samples"]:
+        return None
+    move = win[-1][1] - win[0][1]
+    if abs(move) < cfg["momentum_move_threshold"]:
+        return None
+    steps = [win[i + 1][1] - win[i][1] for i in range(len(win) - 1)]
+    agree = sum(1 for s in steps if (s > 0) == (move > 0))
+    if not steps or agree / len(steps) < cfg["momentum_consistency"]:
+        return None
+    # trending up -> buy ref (0) and ride; trending down -> buy other (1)
+    return (0 if move > 0 else 1), f"ride {move:+.3f}/{cfg['momentum_lookback_min']}m"
+
+
+def strat_favorite(market, history, cfg):
+    """Buy the heavy favorite close to resolution (longshot-bias edge)."""
+    end = market["end"]
+    if end is None:
+        return None
+    days_left = (end - now_ts()) / 86400
+    if not 1 <= days_left <= cfg["favorite_max_days"]:
+        return None
+    lo, hi = cfg["favorite_min_price"], cfg["favorite_max_price"]
+    p = market["ref_price"]
+    if lo <= p <= hi:
+        return 0, f"fav {p:.2f} {days_left:.0f}d"
+    if lo <= 1 - p <= hi:
+        return 1, f"fav {1 - p:.2f} {days_left:.0f}d"
+    return None
+
+
+STRATEGIES = {
+    "mean_reversion": strat_mean_reversion,
+    "momentum": strat_momentum,
+    "favorite": strat_favorite,
+}
+
+
+def eval_strategies(market, history, cfg):
+    """Returns (strategy_name, token_index, note) for the first strategy that
+    fires, in cfg order; or None."""
+    for name in cfg["strategies"]:
+        fn = STRATEGIES.get(name)
+        if fn is None:
+            continue
+        hit = fn(market, history, cfg)
+        if hit:
+            return name, hit[0], hit[1]
+    return None
 
 
 def exit_signal(pos, side_price, market_end, cfg):
@@ -305,10 +414,11 @@ class PaperBroker:
     def __init__(self, state, cfg):
         self.cash = state["cash"]
         self.realized = state["realized"]
+        self.rbs = state.get("realized_by_strategy", {})
         self.positions = state["positions"]
         self.cfg = cfg
 
-    def open(self, market, token_index, price, move):
+    def open(self, market, token_index, price, strategy, note):
         usd = min(self.cfg["position_usd"], self.cash * self.cfg["max_alloc_frac"])
         if usd < 1 or price <= 0:
             return None
@@ -319,6 +429,8 @@ class PaperBroker:
         pos = {
             "market_id": market["id"],
             "question": market["question"],
+            "strategy": strategy,
+            "note": note,
             "token_index": token_index,
             "token_id": market["tokens"][token_index],
             "outcome": market["outcomes"][token_index],
@@ -327,12 +439,11 @@ class PaperBroker:
             "cost": usd,
             "entry_ts": now_ts(),
             "last_price": price,
-            "trigger_move": move,
         }
         self.positions[market["id"]] = pos
         record_trade("OPEN", pos, price, self.cash)
-        log(f"OPEN  {market['question'][:60]!r}  buy {pos['outcome']} @ {price:.3f}"
-            f"  ${usd:.2f} ({shares:.1f} sh)  trigger {move:+.3f}")
+        log(f"OPEN  [{strategy}] {market['question'][:52]!r}  buy {pos['outcome']} "
+            f"@ {price:.3f}  ${usd:.2f} ({shares:.1f} sh)  {note}")
         return pos
 
     def close(self, market_id, price, reason):
@@ -341,9 +452,11 @@ class PaperBroker:
         pnl = proceeds - pos["cost"]
         self.cash += proceeds
         self.realized += pnl
+        strat = pos.get("strategy", "?")
+        self.rbs[strat] = self.rbs.get(strat, 0.0) + pnl
         record_trade(f"CLOSE:{reason}", pos, price, self.cash)
-        log(f"CLOSE {pos['question'][:60]!r}  sell {pos['outcome']} @ {price:.3f}"
-            f"  pnl ${pnl:+.2f} ({reason})  bankroll ${self.cash:.2f}")
+        log(f"CLOSE [{strat}] {pos['question'][:52]!r}  sell {pos['outcome']} "
+            f"@ {price:.3f}  pnl ${pnl:+.2f} ({reason})  bankroll ${self.cash:.2f}")
         return pnl
 
 
@@ -389,8 +502,9 @@ def run_iteration(cfg, state):
     for m in markets[: cfg["universe_size"]]:
         hist = history.setdefault(m["id"], [])
         hist.append([now_ts(), m["ref_price"]])
-        keep_after = now_ts() - cfg["lookback_min"] * 60 * 3
-        history[m["id"]] = [h for h in hist if h[0] >= keep_after][-60:]
+        span_min = max(cfg["lookback_min"], cfg["momentum_lookback_min"])
+        keep_after = now_ts() - span_min * 60 * 1.5
+        history[m["id"]] = [h for h in hist if h[0] >= keep_after][-300:]
         hist = history[m["id"]]
 
         if m["id"] in broker.positions:
@@ -405,13 +519,14 @@ def run_iteration(cfg, state):
         if m["spread"] > cfg["max_spread"]:
             continue
 
-        idx, move = entry_signal(hist, cfg)
-        if idx is None:
+        hit = eval_strategies(m, hist, cfg)
+        if hit is None:
             continue
+        strategy, idx, note = hit
         fill = side_fill_price(m, idx, "ask")
-        if not cfg["price_min"] <= fill <= cfg["price_max"]:
+        if not 0.02 <= fill <= 0.98:
             continue
-        broker.open(m, idx, fill, move)
+        broker.open(m, idx, fill, strategy, note)
 
     # drop history for markets we no longer track and hold no position in
     tracked = {m["id"] for m in markets[: cfg["universe_size"]]}
@@ -470,6 +585,10 @@ def run_report(cfg, state):
     print(f"start bankroll: ${cfg['start_bankroll']:.2f}")
     print(f"cash:           ${broker.cash:.2f}")
     print(f"realized P&L:   ${broker.realized:+.2f}")
+    if broker.rbs:
+        print("  by strategy:")
+        for k, v in sorted(broker.rbs.items(), key=lambda kv: -kv[1]):
+            print(f"    {k:16} ${v:+.2f}")
     print(f"open positions: {len(broker.positions)}")
     equity = broker.cash
     for p in broker.positions.values():
@@ -478,7 +597,7 @@ def run_report(cfg, state):
         equity += p["shares"] * cur
         unreal = p["shares"] * cur - p["cost"]
         held_h = (now_ts() - p["entry_ts"]) / 3600
-        print(f"  {p['question'][:52]!r}  {p['outcome']}  "
+        print(f"  [{p.get('strategy', '?')}] {p['question'][:44]!r}  {p['outcome']}  "
               f"entry {p['entry_price']:.3f} now {cur:.3f}  "
               f"unreal ${unreal:+.2f}  {held_h:.1f}h")
     print(f"equity:         ${equity:.2f}  "
@@ -494,34 +613,56 @@ def run_selftest():
     LOG_PATH = os.path.join(tmp, "bot.log")
 
     cfg = dict(DEFAULTS)
-    state = {"cash": 1000.0, "realized": 0.0, "positions": {},
-             "history": {}, "cooldowns": {}}
+    state = {"cash": 1000.0, "realized": 0.0, "realized_by_strategy": {},
+             "positions": {}, "history": {}, "cooldowns": {}}
     b = PaperBroker(state, cfg)
     mkt = {"id": "m1", "question": "Test?", "outcomes": ["Yes", "No"],
            "tokens": ["tY", "tN"], "end": None,
-           "best_bid0": 0.48, "best_ask0": 0.52}
+           "best_bid0": 0.48, "best_ask0": 0.52, "ref_price": 0.50}
 
-    b.open(mkt, 1, 0.50, 0.12)                 # buy "No" at 0.50, $50
+    b.open(mkt, 1, 0.50, "mean_reversion", "t")   # buy "No" at 0.50, $50
     assert abs(b.cash - 950.0) < 1e-6, b.cash
     assert abs(b.positions["m1"]["shares"] - 100.0) < 1e-6
     assert b.positions["m1"]["token_index"] == 1
-    b.close("m1", 0.60, "take_profit")        # 100 * (0.60 - 0.50) = +10
+    b.close("m1", 0.60, "take_profit")            # 100 * (0.60 - 0.50) = +10
     assert abs(b.realized - 10.0) < 1e-6, b.realized
     assert abs(b.cash - 1010.0) < 1e-6, b.cash
+    assert abs(b.rbs["mean_reversion"] - 10.0) < 1e-6, b.rbs
 
     # mirror pricing for outcome 1
     assert abs(side_fill_price(mkt, 1, "ask") - (1 - 0.48)) < 1e-9
     assert abs(side_fill_price(mkt, 0, "ask") - 0.52) < 1e-9
 
     t = 1_000_000.0
-    up = [(t + i * 300, 0.40 + i * 0.02) for i in range(7)]
-    assert entry_signal(up, cfg) == (1, up[-1][1] - up[0][1])
+    mm = {"end": None, "ref_price": 0.5}
+    # mean_reversion: a sharp move fires, flat doesn't, too-few-samples doesn't
+    up = [(t + i * 300, 0.40 + i * 0.02) for i in range(7)]        # +0.12 / 30m
+    assert strat_mean_reversion(mm, up, cfg)[0] == 1
     down = [(t + i * 300, 0.60 - i * 0.02) for i in range(7)]
-    idx, move = entry_signal(down, cfg)
-    assert idx == 0 and move < -0.08, (idx, move)
+    assert strat_mean_reversion(mm, down, cfg)[0] == 0
     flat = [(t + i * 300, 0.50 + (0.001 if i % 2 else -0.001)) for i in range(7)]
-    assert entry_signal(flat, cfg)[0] is None
-    assert entry_signal(up[:2], cfg)[0] is None
+    assert strat_mean_reversion(mm, flat, cfg) is None
+    assert strat_mean_reversion(mm, up[:2], cfg) is None
+
+    # momentum: a long consistent grind fires; a choppy series does not
+    grind = [(t + i * 600, 0.30 + i * 0.02) for i in range(18)]    # +0.34 / 170m
+    assert strat_momentum(mm, grind, cfg)[0] == 0
+    choppy = [(t + i * 600, 0.50 + (0.05 if i % 2 else -0.05)) for i in range(18)]
+    assert strat_momentum(mm, choppy, cfg) is None
+
+    # favorite: strong favorite near resolution fires; not otherwise
+    soon = now_ts() + 10 * 86400
+    assert strat_favorite({"end": soon, "ref_price": 0.93}, [], cfg)[0] == 0
+    assert strat_favorite({"end": soon, "ref_price": 0.07}, [], cfg)[0] == 1
+    assert strat_favorite({"end": soon, "ref_price": 0.60}, [], cfg) is None
+    far = now_ts() + 90 * 86400
+    assert strat_favorite({"end": far, "ref_price": 0.93}, [], cfg) is None
+
+    # eval_strategies respects priority order and the spike-vs-trend split
+    name, idx, _ = eval_strategies(mm, up, cfg)
+    assert name == "mean_reversion" and idx == 1
+    name, idx, _ = eval_strategies(mm, grind, cfg)
+    assert name == "momentum" and idx == 0, (name, idx)
 
     p = {"entry_price": 0.50, "entry_ts": now_ts()}
     assert exit_signal(p, 0.58, None, cfg) == "take_profit"
