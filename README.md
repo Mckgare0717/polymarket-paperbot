@@ -1,29 +1,47 @@
 # Polymarket paper-trading bot
 
-Phase 1 of the "trade like a pro" idea: **one strategy, paper money, prove an edge first.**
+**Multiple strategies, paper money, prove an edge before risking anything real.**
 
 No wallet, no private keys, no real funds. It reads public Polymarket data,
 simulates trades against the quoted book, and tracks a fake $1,000 bankroll.
 If this doesn't make money on paper over a few weeks, it won't make money real.
 
-## The strategy (what "you pick" picked)
+## Strategies
 
-**Short-term mean reversion on binary markets.**
+Run in priority order — the first that fires on a market takes it. Every trade
+is tagged, so `report` shows P&L **per strategy** (that's the whole point: find
+out which one works).
 
-- Watch the top ~40 active 2-outcome markets by 24h volume, priced between
-  0.05 and 0.95.
-- Sample outcome-0's price every poll. If it jumped more than **8 points**
-  (`spike_threshold`) over the last **60 min** (`lookback_min`), bet on it
-  reverting: spike up → buy the *other* side, spike down → buy *that* side.
-- Enter at the current best ask, only if the spread is under 4 points.
-- Exit on: **+15%** on the position (`take_profit_pct`), **-20%**
-  (`stop_loss_pct`), **24h** elapsed (`max_hold_hours`), or the market getting
-  close to resolution. Then a 6h cooldown on that market.
-- Max 5 open positions, $50 each, never more than 20% of bankroll in one.
+| Strategy | Bets that… | Fires when |
+|---|---|---|
+| `mean_reversion` | a sharp spike overshot | price moved ≥ `spike_threshold` in `lookback_min`, and it's a spike not a longer trend |
+| `momentum` | a steady trend continues | price moved ≥ `momentum_move_threshold` over `momentum_lookback_min`, consistently one direction |
+| `favorite` | heavy favorites are underpriced (longshot bias) | favorite side is `favorite_min_price`–`favorite_max_price` and resolves within `favorite_max_days` |
 
-Why this one: it's simple to reason about, doesn't need a forecasting model,
-and short-term overreactions in thin markets are a real, documented pattern.
-It is **not** guaranteed to work — that's what the paper run tells us.
+**Universe:** top markets by 24h volume, binary, priced 0.05–0.97, minus
+anything matching `exclude_keywords` (head-to-head sports by default — fading a
+spike there means betting against a real goal/injury).
+
+**Exit (all strategies):** +15% take-profit, −20% stop-loss, 24h time stop, or
+market near resolution. Then a 6h per-market cooldown.
+
+**Sizing:** max 5 open positions, $50 each, ≤ 20% of bankroll per position.
+
+## AI filter (optional)
+
+If `GROQ_API_KEY` (or `AI_API_KEY`) is in the environment, every candidate
+trade is run past an LLM over an OpenAI-compatible endpoint (default: Groq,
+`qwen/qwen3.8-27b`). It can veto a trade whose price move looks news-driven
+rather than noise. It **fails open** — a dead or slow API never blocks trading —
+and defaults to allowing unless it has a specific concrete objection, which is
+logged. Toggle with `ai_filter` in config; swap provider via `ai_base_url` /
+`ai_model`.
+
+Current limitation: the model reasons from training knowledge, so it mostly
+rubber-stamps and only occasionally catches something. A live news feed
+(`groq/compound-mini` has web search) is the upgrade path.
+
+    python paperbot.py ai "Will the Fed cut rates in September?"   # test the LLM link
 
 ## Quick start
 

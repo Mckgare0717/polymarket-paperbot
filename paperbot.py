@@ -20,8 +20,10 @@ and every trade is tagged so `report` shows per-strategy P&L):
 Exit (all strategies): take-profit / stop-loss on the held side's own price, a
 hard time stop, or the market nearing resolution. Then a per-market cooldown.
 
-News / X sentiment is NOT here yet -- that piece has to prove an edge on its own
-before it gates real trades.
+AI filter: if GROQ_API_KEY (or AI_API_KEY) is set, every candidate trade is
+sanity-checked by an LLM over an OpenAI-compatible endpoint -- it can veto a
+trade whose price move looks news-driven rather than noise. Fails open (a dead
+API never blocks trading). Toggle with cfg["ai_filter"].
 
 Usage:
     python paperbot.py selftest   # internal checks, run this first
@@ -29,6 +31,7 @@ Usage:
     python paperbot.py run        # loop forever (persistent process)
     python paperbot.py report     # print paper P&L + open positions
     python paperbot.py trades     # dump all recorded trades as CSV to stdout
+    python paperbot.py ai "<q>"   # test the LLM connection on one question
 
 Set STATE_DIR to put state.json / trades.csv / bot.log somewhere else -- point
 it at a mounted persistent disk in the cloud so a restart keeps the bankroll
@@ -119,6 +122,13 @@ DEFAULTS = {
         "serie a", "bundesliga", "champions league", "valorant", "lol:",
         "cs2", "counter-strike", " bo3", " bo5", "vct",
     ],
+
+    # LLM sanity-check on each candidate trade (only active when an API key is
+    # in the environment). OpenAI-compatible endpoint -- swap provider freely.
+    "ai_filter": True,
+    "ai_base_url": "https://api.groq.com/openai/v1",
+    "ai_model": "qwen/qwen3.8-27b",
+    "ai_timeout": 20,
 }
 
 
@@ -394,6 +404,72 @@ def eval_strategies(market, history, cfg):
     return None
 
 
+# ------------------------------------------------------------------- ai filter
+
+def _ai_key():
+    return os.environ.get("GROQ_API_KEY") or os.environ.get("AI_API_KEY")
+
+
+def ai_available(cfg):
+    return bool(_ai_key()) and cfg.get("ai_filter", True)
+
+
+def _ai_complete(cfg, prompt):
+    body = json.dumps({
+        "model": cfg["ai_model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 200,
+        "response_format": {"type": "json_object"},
+    }).encode()
+    req = urllib.request.Request(
+        cfg["ai_base_url"].rstrip("/") + "/chat/completions",
+        data=body, method="POST",
+        headers={"Authorization": f"Bearer {_ai_key()}",
+                 "Content-Type": "application/json",
+                 "User-Agent": "paperbot/1.0"})  # bare urllib UA gets CF-blocked
+    with urllib.request.urlopen(req, timeout=cfg["ai_timeout"]) as r:
+        d = json.loads(r.read().decode())
+    return d["choices"][0]["message"]["content"]
+
+
+def parse_ai_verdict(raw):
+    """LLM JSON -> (allow: bool, reason: str). Anything unparseable allows."""
+    try:
+        v = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return True, "unparseable verdict"
+    allow = str(v.get("decision", "take")).strip().lower() != "skip"
+    return allow, str(v.get("reason", ""))[:140]
+
+
+def ai_check(market, strategy, token_index, note, cfg):
+    """(allow, reason). Fails OPEN -- a dead API must never block trading."""
+    side = market["outcomes"][token_index]
+    prompt = (
+        "A technical trading rule found a statistical signal on a Polymarket "
+        "prediction market and wants to place this trade. You are the veto "
+        "check. DEFAULT TO ALLOWING. Only answer \"skip\" if you have a "
+        "SPECIFIC concrete reason -- a known recent event, scheduled "
+        "announcement, or clear structural problem -- that makes this "
+        "particular trade likely to lose. General caution, 'depends on news', "
+        "or 'markets are hard' are NOT reasons to skip.\n\n"
+        f"Market: {market['question']}\n"
+        f"Price of '{market['outcomes'][0]}': {market['ref_price']:.2f}\n"
+        f"Rule: {strategy} -- {note}\n"
+        f"Trade: BUY '{side}'\n\n"
+        "For a mean_reversion trade, skip only if you know of real news in the "
+        "last day that explains the move (then it is not noise). For momentum, "
+        "skip only if you expect an imminent reversal. For favorite, skip only "
+        "if the favorite is in real jeopardy.\n"
+        'Reply ONLY as JSON: {"decision": "take" or "skip", "reason": "<15 words"}'
+    )
+    try:
+        return parse_ai_verdict(_ai_complete(cfg, prompt))
+    except Exception as e:  # noqa: BLE001 - never let the filter break the bot
+        return True, f"ai unavailable ({type(e).__name__})"
+
+
 def exit_signal(pos, side_price, market_end, cfg):
     entry = pos["entry_price"]
     held_h = (now_ts() - pos["entry_ts"]) / 3600
@@ -526,6 +602,14 @@ def run_iteration(cfg, state):
         fill = side_fill_price(m, idx, "ask")
         if not 0.02 <= fill <= 0.98:
             continue
+        if ai_available(cfg):
+            allow, why = ai_check(m, strategy, idx, note, cfg)
+            log(f"  ai {'OK  ' if allow else 'SKIP'} [{strategy}] "
+                f"{m['question'][:44]!r}: {why}")
+            if not allow:
+                cooldowns[m["id"]] = now_ts()  # don't re-ask every cycle
+                continue
+            note = f"{note} | ai:{why}"
         broker.open(m, idx, fill, strategy, note)
 
     # drop history for markets we no longer track and hold no position in
@@ -664,6 +748,15 @@ def run_selftest():
     name, idx, _ = eval_strategies(mm, grind, cfg)
     assert name == "momentum" and idx == 0, (name, idx)
 
+    # ai verdict parsing; fails open on junk
+    assert parse_ai_verdict('{"decision":"take","reason":"noise"}') == (True, "noise")
+    assert parse_ai_verdict('{"decision":"SKIP","reason":"ceasefire talks broke down"}')[0] is False
+    assert parse_ai_verdict("not json at all")[0] is True
+    assert parse_ai_verdict('{"reason":"x"}')[0] is True  # missing decision -> allow
+    os.environ.pop("GROQ_API_KEY", None)
+    os.environ.pop("AI_API_KEY", None)
+    assert ai_available(cfg) is False
+
     p = {"entry_price": 0.50, "entry_ts": now_ts()}
     assert exit_signal(p, 0.58, None, cfg) == "take_profit"
     assert exit_signal(p, 0.39, None, cfg) == "stop_loss"
@@ -683,6 +776,15 @@ def main():
     cfg = load_config()
     if mode == "trades":
         run_dump_trades(cfg)
+        return
+    if mode == "ai":
+        q = sys.argv[2] if len(sys.argv) > 2 else "Will the US enter a recession in 2026?"
+        if not _ai_key():
+            print("no GROQ_API_KEY / AI_API_KEY in environment")
+            return
+        fake = {"question": q, "outcomes": ["Yes", "No"], "ref_price": 0.42}
+        print(f"model: {cfg['ai_model']}  @ {cfg['ai_base_url']}")
+        print(ai_check(fake, "mean_reversion", 0, "fade -0.10/60m", cfg))
         return
     if mode in ("report", "once"):
         state = load_state(cfg)

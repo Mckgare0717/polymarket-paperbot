@@ -35,5 +35,10 @@
     "ufc", "nba ", "nfl ", "mlb ", "nhl ", "premier league", "la liga",
     "serie a", "bundesliga", "champions league", "valorant", "lol:",
     "cs2", "counter-strike", " bo3", " bo5", "vct"
-  ]
+  ],
+
+  "ai_filter": true,
+  "ai_base_url": "https://api.groq.com/openai/v1",
+  "ai_model": "qwen/qwen3.8-27b",
+  "ai_timeout": 20
 }
