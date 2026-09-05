@@ -665,8 +665,9 @@ def run_iteration(cfg, state):
         f"realized ${broker.realized:+.2f} | open {len(broker.positions)}")
 
 
-def start_health_server():
-    """Render web services need an open port. No-op locally (no PORT set)."""
+def start_health_server(cfg):
+    """Serve the port Render needs, plus /report and /trades for checking in
+    without the Render shell. No-op locally (no PORT set)."""
     port = os.environ.get("PORT")
     if not port:
         return
@@ -675,16 +676,31 @@ def start_health_server():
 
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            try:
+                if self.path.startswith("/report"):
+                    body = report_text(cfg, load_state(cfg)).encode()
+                elif self.path.startswith("/trades"):
+                    body = (open(TRADES_PATH, "rb").read()
+                            if os.path.exists(TRADES_PATH)
+                            else b"no trades yet\n")
+                else:
+                    body = b"paperbot ok"
+            except Exception as e:  # noqa: BLE001
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(f"error: {e}".encode())
+                return
             self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(b"paperbot ok")
+            self.wfile.write(body)
 
         def log_message(self, *_):
             pass
 
     srv = http.server.HTTPServer(("0.0.0.0", int(port)), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log(f"health server on :{port}")
+    log(f"health server on :{port}  (/report /trades)")
 
 
 def run_dump_trades(cfg):
@@ -695,22 +711,26 @@ def run_dump_trades(cfg):
         sys.stdout.write(",".join(TRADE_HEADER) + "\n")
 
 
-def run_report(cfg, state):
+def report_text(cfg, state, live_prices=True):
     broker = PaperBroker(state, cfg)
     by_id = {}
-    try:
-        by_id = {m["id"]: m for m in fetch_markets(cfg)}
-    except Exception as e:  # noqa: BLE001
-        log(f"(report) market fetch failed, using last stored prices: {e}")
-    print(f"created:        {state.get('created')}")
-    print(f"start bankroll: ${cfg['start_bankroll']:.2f}")
-    print(f"cash:           ${broker.cash:.2f}")
-    print(f"realized P&L:   ${broker.realized:+.2f}")
+    if live_prices:
+        try:
+            by_id = {m["id"]: m for m in fetch_markets(cfg)}
+        except Exception:  # noqa: BLE001
+            pass
+    L = [
+        f"created:        {state.get('created')}",
+        f"as of:          {iso(now_ts())}",
+        f"start bankroll: ${cfg['start_bankroll']:.2f}",
+        f"cash:           ${broker.cash:.2f}",
+        f"realized P&L:   ${broker.realized:+.2f}",
+    ]
     if broker.rbs:
-        print("  by strategy:")
+        L.append("  by strategy:")
         for k, v in sorted(broker.rbs.items(), key=lambda kv: -kv[1]):
-            print(f"    {k:16} ${v:+.2f}")
-    print(f"open positions: {len(broker.positions)}")
+            L.append(f"    {k:16} ${v:+.2f}")
+    L.append(f"open positions: {len(broker.positions)}")
     equity = broker.cash
     for p in broker.positions.values():
         m = by_id.get(p["market_id"])
@@ -718,11 +738,16 @@ def run_report(cfg, state):
         equity += p["shares"] * cur
         unreal = p["shares"] * cur - p["cost"]
         held_h = (now_ts() - p["entry_ts"]) / 3600
-        print(f"  [{p.get('strategy', '?')}] {p['question'][:44]!r}  {p['outcome']}  "
-              f"entry {p['entry_price']:.3f} now {cur:.3f}  "
-              f"unreal ${unreal:+.2f}  {held_h:.1f}h")
-    print(f"equity:         ${equity:.2f}  "
-          f"({(equity / cfg['start_bankroll'] - 1) * 100:+.1f}%)")
+        L.append(f"  [{p.get('strategy', '?')}] {p['question'][:44]!r}  "
+                 f"{p['outcome']}  entry {p['entry_price']:.3f} now {cur:.3f}  "
+                 f"unreal ${unreal:+.2f}  {held_h:.1f}h")
+    L.append(f"equity:         ${equity:.2f}  "
+             f"({(equity / cfg['start_bankroll'] - 1) * 100:+.1f}%)")
+    return "\n".join(L)
+
+
+def run_report(cfg, state):
+    print(report_text(cfg, state))
 
 
 def run_selftest():
@@ -847,7 +872,7 @@ def main():
 
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
-    start_health_server()
+    start_health_server(cfg)
 
     def nap(seconds):
         for _ in range(int(seconds)):
