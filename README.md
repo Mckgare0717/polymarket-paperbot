@@ -61,6 +61,22 @@ under a supervisor (systemd, pm2, nssm) so it restarts on crash/reboot.
 **Option C — a Claude Code scheduled agent** running `paperbot.py once` on a
 cron. Ask me to set that up if you want it.
 
+**Option D — Render (cloud, always on):** deployed as a web service running
+`paperbot.py run`.
+
+- Repo: https://github.com/Mckgare0717/polymarket-paperbot (public, no secrets)
+- Service: `polymarket-paperbot` — https://dashboard.render.com/web/srv-dae7rsfqj5pc73ajf4og
+- `starter` plan, ~$7/mo, always on. Serves a dummy health page on `$PORT`.
+- **State needs a disk.** `STATE_DIR=/data` is set. In the Render dashboard →
+  the service → **Disks** → **Add Disk**: name `state`, mount path `/data`,
+  size 1 GB (~$0.25/mo). Without it the bot still runs, but a redeploy/restart
+  resets to a fresh $1,000.
+- Read results: `python paperbot.py report` won't work remotely — use the
+  Render **Shell** tab (`python paperbot.py report`, `python paperbot.py trades`)
+  or just read `bot.log` in the **Logs** tab.
+- The free Key Value store `paperbot-kv` from an earlier attempt is unused —
+  delete it in the dashboard.
+
 ## Files it writes
 
 | file | what |
