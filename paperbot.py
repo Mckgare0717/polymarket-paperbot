@@ -26,8 +26,10 @@ Usage:
     python paperbot.py report     # print paper P&L + open positions
     python paperbot.py trades     # dump all recorded trades as CSV to stdout
 
-Set REDIS_URL to keep state + trades in Redis instead of local files (cloud
-mode). Set PORT and the `run` loop also serves a health endpoint (Render).
+Set STATE_DIR to put state.json / trades.csv / bot.log somewhere else -- point
+it at a mounted persistent disk in the cloud so a restart keeps the bankroll
+and open positions. Set PORT and the `run` loop also serves a health endpoint
+(Render sets PORT automatically).
 """
 
 import csv
@@ -40,32 +42,14 @@ import urllib.request
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = os.environ.get("STATE_DIR") or HERE
+os.makedirs(STATE_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(HERE, "config.json")
-STATE_PATH = os.path.join(HERE, "state.json")
-TRADES_PATH = os.path.join(HERE, "trades.csv")
-LOG_PATH = os.path.join(HERE, "bot.log")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+TRADES_PATH = os.path.join(STATE_DIR, "trades.csv")
+LOG_PATH = os.path.join(STATE_DIR, "bot.log")
 
 GAMMA = "https://gamma-api.polymarket.com"
-
-# Cloud mode: if REDIS_URL is set, state + trades live in Redis instead of local
-# files, so a Render/VPS restart doesn't wipe the bankroll and open positions.
-_REDIS = None
-
-
-def redis_client():
-    """Connected client if REDIS_URL is set, else None. Raises if set but down
-    (callers in `run` mode retry; a fresh KV can take a minute to resolve)."""
-    global _REDIS
-    if _REDIS is not None:
-        return _REDIS
-    url = os.environ.get("REDIS_URL")
-    if not url:
-        return None
-    import redis  # only needed in cloud mode
-    client = redis.from_url(url, decode_responses=True, socket_connect_timeout=5)
-    client.ping()
-    _REDIS = client
-    return _REDIS
 
 DEFAULTS = {
     "start_bankroll": 1000.0,
@@ -148,10 +132,6 @@ def _fresh_state(cfg):
 
 
 def load_state(cfg):
-    r = redis_client()
-    if r is not None:
-        raw = r.get("paperbot:state")
-        return json.loads(raw) if raw else _fresh_state(cfg)
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH, encoding="utf-8") as f:
             return json.load(f)
@@ -162,10 +142,6 @@ def save_state(state, broker):
     state["cash"] = broker.cash
     state["realized"] = broker.realized
     state["positions"] = broker.positions
-    r = redis_client()
-    if r is not None:
-        r.set("paperbot:state", json.dumps(state))
-        return
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
@@ -173,19 +149,14 @@ def save_state(state, broker):
 
 
 def record_trade(action, pos, price, cash_after):
-    row = [iso(now_ts()), action, pos["market_id"], pos["question"],
-           pos["outcome"], f"{price:.4f}", f"{pos['shares']:.4f}",
-           f"{pos['cost']:.2f}", f"{cash_after:.2f}"]
-    r = redis_client()
-    if r is not None:
-        r.rpush("paperbot:trades", json.dumps(row))
-        return
     newfile = not os.path.exists(TRADES_PATH)
     with open(TRADES_PATH, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if newfile:
             w.writerow(TRADE_HEADER)
-        w.writerow(row)
+        w.writerow([iso(now_ts()), action, pos["market_id"], pos["question"],
+                    pos["outcome"], f"{price:.4f}", f"{pos['shares']:.4f}",
+                    f"{pos['cost']:.2f}", f"{cash_after:.2f}"])
 
 
 # ---------------------------------------------------------------- market access
@@ -463,16 +434,11 @@ def start_health_server():
 
 
 def run_dump_trades(cfg):
-    r = redis_client()
-    w = csv.writer(sys.stdout)
-    w.writerow(TRADE_HEADER)
-    if r is not None:
-        for x in r.lrange("paperbot:trades", 0, -1):
-            w.writerow(json.loads(x))
-    elif os.path.exists(TRADES_PATH):
+    if os.path.exists(TRADES_PATH):
         with open(TRADES_PATH, encoding="utf-8") as f:
-            next(f, None)
             sys.stdout.write(f.read())
+    else:
+        sys.stdout.write(",".join(TRADE_HEADER) + "\n")
 
 
 def run_report(cfg, state):

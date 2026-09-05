@@ -1,1 +1,2 @@
-redis>=5,<6
+# No third-party dependencies -- standard library only.
+# This file exists so Render detects the Python runtime.
